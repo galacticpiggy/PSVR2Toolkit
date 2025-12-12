@@ -11,7 +11,10 @@
 #include "vr_settings.h"
 #include "util.h"
 
+#include "adaptive_gaze_smoother.h"
+
 #include <cstdint>
+#include <mutex>
 
 namespace psvr2_toolkit {
 
@@ -90,6 +93,14 @@ namespace psvr2_toolkit {
       static_cast<double>(frequency.QuadPart)) * 1e6);
   }
 
+  // Use function-local static and mutex to avoid static init order races and concurrent access
+  static std::mutex g_gazeSmootherMutex;
+  static int g_gazeLogCounter = 0;
+  static AdaptiveGazeSmoother& GetGazeSmoother() {
+    static AdaptiveGazeSmoother instance;
+    return instance;
+  }
+
   void HmdDeviceHooks::UpdateGaze(void* pData, size_t dwSize)
   {
     Hmd2GazeState* pGazeState = reinterpret_cast<Hmd2GazeState*>(pData);
@@ -104,14 +115,42 @@ namespace psvr2_toolkit {
     auto& origin = pGazeState->combined.gazeOriginMm;
     auto& direction = pGazeState->combined.gazeDirNorm;
 
-    eyeTrackingData.vGazeOrigin = vr::HmdVector3_t{ -origin.x / 1000.0f, origin.y / 1000.0f, -origin.z / 1000.0f };
-    eyeTrackingData.vGazeTarget = vr::HmdVector3_t{ -direction.x, direction.y, -direction.z };
+    vr::HmdVector3_t rawDir = vr::HmdVector3_t{ -direction.x, direction.y, -direction.z };
 
     int64_t hmdToHostOffset;
 
     CaesarManager__getIMUTimestampOffset(CaesarManager__getInstance(), &hmdToHostOffset);
 
     double timeOffset = ((static_cast<int64_t>(pGazeState->combined.timestamp) + hmdToHostOffset) - GetHostTimestamp()) / 1e6;
+
+    // compute timestamp microseconds for smoothing
+    int64_t sampleTimestampUs = static_cast<int64_t>(pGazeState->combined.timestamp) + hmdToHostOffset;
+
+    vr::HmdVector3_t outDir = rawDir;
+    if (valid) {
+      // Protect smoother from concurrent access and ensure it is initialized before use
+      AdaptiveGazeSmoother& s = GetGazeSmoother();
+      {
+        std::lock_guard<std::mutex> guard(g_gazeSmootherMutex);
+        outDir = s.Process(rawDir, sampleTimestampUs);
+      }
+    }
+
+    eyeTrackingData.vGazeOrigin = vr::HmdVector3_t{ -origin.x / 1000.0f, origin.y / 1000.0f, -origin.z / 1000.0f };
+    eyeTrackingData.vGazeTarget = outDir;
+
+    // occasional debug log of smoothing amount
+    if (++g_gazeLogCounter >= 240) { // roughly every 2 seconds at 120Hz
+      g_gazeLogCounter = 0;
+      float smoothing = 0.0f;
+      {
+        std::lock_guard<std::mutex> guard(g_gazeSmootherMutex);
+        smoothing = GetGazeSmoother().GetSmoothingAmount();
+      }
+      char buf[128];
+      snprintf(buf, sizeof(buf), "[AdaptiveGazeSmoother] smoothing=%.3f", smoothing);
+      vr::VRDriverLog()->Log(buf);
+    }
 
     (vr::VRDriverInput())->UpdateEyeTrackingComponent(eyeTrackingComponent, &eyeTrackingData, timeOffset);
 
